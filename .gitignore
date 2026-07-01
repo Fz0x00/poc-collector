@@ -5,3 +5,4 @@ __pycache__/
 data/cache/
 data/poc-results.json
 data/poc-report.md
+README.md
