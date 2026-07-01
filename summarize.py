@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-repo-summarize — 用 LLM 总结 GitHub 仓库
+repo-summarize — 两阶段 GitHub 仓库分析工具
 
-通过 git clone 浅克隆仓库到本地，读取实际代码后用 LLM 分析。
+Stage 1: 读 README，LLM 判断是否值得深入
+Stage 2: clone 仓库，读源码，生成完整报告
 
 用法:
   python3 summarize.py owner/repo
-  python3 summarize.py https://github.com/owner/repo
   python3 summarize.py owner/repo --lang zh
+  python3 summarize.py owner/repo --json
+  python3 summarize.py owner/repo --skip-stage1   # 跳过筛选，直接分析
 """
 
 import argparse
@@ -28,12 +30,54 @@ CODE_EXTS = {
     '.html', '.jsx', '.tsx', '.vue', '.svelte',
 }
 
+# ─── HTTP helpers ──────────────────────────────────────────────
 
 def _opener():
     proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY')
     if proxy:
         return urllib.request.build_opener(urllib.request.ProxyHandler({'https': proxy, 'http': proxy}))
     return urllib.request.build_opener()
+
+
+def _github_get(url, token=None, timeout=15):
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'repo-summarize/1.0'}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with _opener().open(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            print('GitHub API rate limit — 设置 GITHUB_TOKEN', file=sys.stderr)
+        elif e.code == 404:
+            print(f'仓库不存在: {url}', file=sys.stderr)
+        else:
+            print(f'GitHub API 错误 {e.code}', file=sys.stderr)
+        sys.exit(1)
+
+
+def _llm_call(messages, api_key, api_base=None, model='gpt-4o-mini', max_tokens=500):
+    api_base = api_base or os.environ.get('OPENAI_API_BASE', 'https://api.openai.com/v1')
+    payload = json.dumps({
+        'model': model,
+        'messages': messages,
+        'temperature': 0.2,
+        'max_tokens': max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        f'{api_base}/chat/completions',
+        data=payload,
+        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
+    )
+    with _opener().open(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+        content = data['choices'][0]['message']['content'].strip()
+        if content.startswith('```'):
+            content = content.split('```')[1]
+            if content.startswith('json'):
+                content = content[4:]
+        return json.loads(content)
 
 
 def parse_repo(input_str):
@@ -45,6 +89,63 @@ def parse_repo(input_str):
     sys.exit(1)
 
 
+# ─── Stage 1: README 快速筛选 ─────────────────────────────────
+
+def fetch_readme(owner, name, token=None):
+    """通过 GitHub API 获取 README（不 clone）。"""
+    import base64
+    try:
+        r = _github_get(f'https://api.github.com/repos/{owner}/{name}/readme', token)
+        if r.get('encoding') == 'base64':
+            return base64.b64decode(r['content']).decode('utf-8', errors='replace')[:3000]
+    except SystemExit:
+        pass
+    return ''
+
+
+def fetch_meta(owner, name, token=None):
+    """获取仓库元数据。"""
+    r = _github_get(f'https://api.github.com/repos/{owner}/{name}', token)
+    return {
+        'stars': r.get('stargazers_count', 0),
+        'forks': r.get('forks_count', 0),
+        'language': r.get('language'),
+        'description': r.get('description', ''),
+        'size': r.get('size', 0),
+    }
+
+
+def stage1_screen(owner, name, meta, readme, api_key, model='gpt-4o-mini'):
+    """Stage 1: 用 README 快速判断仓库是否值得深入分析。"""
+    lang_instruction = '用中文回答。' if False else 'Output in English.'
+
+    system_prompt = (
+        "You are a security researcher screening GitHub repos for CVE-related PoC/exploit analysis.\n\n"
+        "Decide if this repo is worth deep analysis (cloning and reading source code).\n\n"
+        + lang_instruction + "\n"
+        'Output JSON: {"verdict": "analyze|skip", "reason": "brief explanation", '
+        '"brief_category": "poc|exploit|detection|analysis|unrelated|malware"}'
+    )
+
+    user_prompt = (
+        f"Screen this repo:\n\n"
+        f"Repo: {owner}/{name}\n"
+        f"Stars: {meta.get('stars',0)}  Language: {meta.get('language','N/A')}  Size: {meta.get('size',0)}KB\n"
+        f"Description: {meta.get('description','N/A')}\n\n"
+        f"README:\n{readme[:2000]}\n\n"
+        "Is this worth cloning and analyzing in detail? Output JSON:"
+    )
+
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+        {'role': 'user', 'content': user_prompt},
+    ]
+
+    return _llm_call(messages, api_key, model=model, max_tokens=150)
+
+
+# ─── Stage 2: Clone + 源码深度分析 ────────────────────────────
+
 def git_clone(owner, name, token=None, tmpdir=None):
     url = f'https://github.com/{owner}/{name}.git'
     if token:
@@ -55,35 +156,30 @@ def git_clone(owner, name, token=None, tmpdir=None):
         capture_output=True, text=True, timeout=120,
     )
     if r.returncode != 0:
-        print(f'clone 失败: {r.stderr.strip()}', file=sys.stderr)
-        sys.exit(1)
+        print(f'  clone 失败: {r.stderr.strip()}', file=sys.stderr)
+        return None
     return dest
 
 
-def walk_repo(repo_dir):
-    """Walk repo directory, return (readme, file_tree, code_snippets)."""
+def read_repo(repo_dir):
+    """读取仓库内容：README + 代码文件。"""
+    # README
     readme = ''
-    readme_path = os.path.join(repo_dir, 'README.md')
-    if os.path.isfile(readme_path):
-        with open(readme_path, errors='replace') as f:
-            readme = f.read()[:2000]
+    for name in ['README.md', 'readme.md', 'README', 'Readme.md']:
+        p = os.path.join(repo_dir, name)
+        if os.path.isfile(p):
+            with open(p, errors='replace') as f:
+                readme = f.read()[:3000]
+            break
 
-    # Also try README (no extension)
-    if not readme:
-        for name in ['readme.md', 'readme', 'README', 'Readme.md']:
-            p = os.path.join(repo_dir, name)
-            if os.path.isfile(p):
-                with open(p, errors='replace') as f:
-                    readme = f.read()[:2000]
-                break
-
+    # 文件树 + 代码片段
     files = []
     code_snippets = []
     code_count = 0
 
     for root, dirs, fnames in os.walk(repo_dir):
-        # Skip hidden dirs and node_modules
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'vendor', 'venv')]
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in (
+            'node_modules', '__pycache__', 'vendor', 'venv', '.git', 'dist', 'build')]
 
         rel_root = os.path.relpath(root, repo_dir)
         if rel_root == '.':
@@ -92,15 +188,15 @@ def walk_repo(repo_dir):
         for fname in sorted(fnames):
             if fname.startswith('.'):
                 continue
-            fpath = os.path.join(root, fname)
             rel_path = os.path.join(rel_root, fname) if rel_root else fname
             files.append(rel_path)
 
             ext = os.path.splitext(fname)[1].lower()
-            if ext in CODE_EXTS and code_count < 5:
+            if ext in CODE_EXTS and code_count < 8:
+                fpath = os.path.join(root, fname)
                 try:
                     with open(fpath, errors='replace') as f:
-                        content = f.read()[:800]
+                        content = f.read()[:1500]
                     code_snippets.append(f'--- {rel_path} ---\n{content}')
                     code_count += 1
                 except Exception:
@@ -109,35 +205,10 @@ def walk_repo(repo_dir):
     return readme, files, code_snippets
 
 
-def build_meta(repo_dir):
-    """Extract basic metadata from repo dir."""
-    lang_counts = {}
-    total_size = 0
-    for root, dirs, fnames in os.walk(repo_dir):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-        for fname in fnames:
-            fpath = os.path.join(root, fname)
-            try:
-                total_size += os.path.getsize(fpath)
-            except OSError:
-                pass
-            ext = os.path.splitext(fname)[1].lower()
-            if ext in CODE_EXTS:
-                lang_counts[ext] = lang_counts.get(ext, 0) + 1
-
-    top_lang = max(lang_counts, key=lang_counts.get) if lang_counts else 'N/A'
-    ext_to_lang = {
-        '.py': 'Python', '.c': 'C', '.cpp': 'C++', '.h': 'C/C++',
-        '.js': 'JavaScript', '.ts': 'TypeScript', '.go': 'Go', '.rs': 'Rust',
-        '.java': 'Java', '.rb': 'Ruby', '.php': 'PHP', '.cs': 'C#',
-    }
-    return {
-        'language': ext_to_lang.get(top_lang, top_lang),
-        'size_kb': total_size // 1024,
-    }
-
-
-def summarize(owner, name, meta, readme, files, code_snippets, lang='en', api_key=None, model='gpt-4o-mini'):
+def stage2_analyze(owner, name, meta, readme, files, code_snippets, lang='zh', api_key=None, model='gpt-4o-mini'):
+    """
+    Stage 2: 深度分析，生成完整报告。
+    """
     file_list = ', '.join(files[:40])
     if len(files) > 40:
         file_list += f' (+{len(files)-40} more)'
@@ -146,58 +217,114 @@ def summarize(owner, name, meta, readme, files, code_snippets, lang='en', api_ke
 
     lang_instruction = '用中文回答。' if lang == 'zh' else 'Output in English.'
 
-    prompt = f"""Analyze this GitHub repository and provide a concise summary.
-
-Repo: {owner}/{name}
-Language: {meta.get('language','N/A')}  Size: {meta.get('size_kb',0)}KB
-Files ({len(files)}): {file_list}
-
-README:
-{readme[:1200]}
-
-Key source code:
-{code_block[:2000]}
-
-{lang_instruction}
-Output JSON:
-{{
-  "summary": ["point1", "point2", "point3"],
-  "tags": ["tag1", "tag2"],
-  "type": "poc|exploit|tool|library|analysis|other"
-}}"""
-
-    api_base = os.environ.get('OPENAI_API_BASE', 'https://api.openai.com/v1')
-    payload = json.dumps({
-        'model': model,
-        'messages': [
-            {'role': 'system', 'content': 'You are a code analyst. Be concise and accurate.'},
-            {'role': 'user', 'content': prompt},
-        ],
-        'temperature': 0.2,
-        'max_tokens': 400,
-    }).encode()
-
-    req = urllib.request.Request(
-        f'{api_base}/chat/completions',
-        data=payload,
-        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
+    system_prompt = (
+        "You are a security researcher analyzing a CVE-related GitHub repository in detail.\n\n"
+        + lang_instruction + "\n"
+        "Output JSON:\n"
+        "{\n"
+        '  "category": "exploit|poc|detection|analysis|unrelated|malware",\n'
+        '  "title": "one-line description",\n'
+        '  "summary": ["detailed point 1", "detailed point 2", "detailed point 3", "..."],\n'
+        '  "technical_details": "how the vulnerability is triggered/exploited, what code does",\n'
+        '  "affected_component": "what software/component is affected",\n'
+        '  "severity_assessment": "critical|high|medium|low|unknown",\n'
+        '  "tags": ["tag1", "tag2"],\n'
+        '  "usage_notes": "how to use this PoC/exploit (if applicable)",\n'
+        '  "confidence": 0.0-1.0\n'
+        "}"
     )
-    with _opener().open(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-        content = data['choices'][0]['message']['content'].strip()
-        if content.startswith('```'):
-            content = content.split('```')[1]
-            if content.startswith('json'):
-                content = content[4:]
-        return json.loads(content)
+
+    user_prompt = (
+        f"Analyze this repository in depth:\n\n"
+        f"Repo: {owner}/{name}\n"
+        f"Stars: {meta.get('stars',0)}  Language: {meta.get('language','N/A')}  Size: {meta.get('size',0)}KB\n"
+        f"Description: {meta.get('description','N/A')}\n\n"
+        f"README:\n{readme}\n\n"
+        f"Files ({len(files)}): {file_list}\n\n"
+        f"Source code:\n{code_block[:4000]}\n\n"
+        "Generate a complete analysis report. Output JSON:"
+    )
+
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+        {'role': 'user', 'content': user_prompt},
+    ]
+
+    return _llm_call(messages, api_key, model=model, max_tokens=600)
+
+
+# ─── 主流程 ────────────────────────────────────────────────────
+
+def analyze(owner, name, api_key, token=None, lang='zh', model='gpt-4o-mini',
+            skip_stage1=False, api_base=None):
+    """
+    完整两阶段分析流程。
+    返回分析结果 dict。
+    """
+    # 获取元数据
+    meta = fetch_meta(owner, name, token)
+    print(f'  ⭐ {meta["stars"]}  🔤 {meta["language"]}  📝 {meta.get("description","")[:60]}', file=sys.stderr)
+
+    # Stage 1: README 筛选
+    if not skip_stage1:
+        print('  [Stage 1] README 筛选...', file=sys.stderr)
+        readme = fetch_readme(owner, name, token)
+        if not readme:
+            print('  ⚠ 无法获取 README，跳过', file=sys.stderr)
+            return {'verdict': 'skip', 'reason': 'no readme'}
+
+        screen = stage1_screen(owner, name, meta, readme, api_key, model=model)
+        verdict = screen.get('verdict', 'skip')
+
+        if verdict == 'skip':
+            print(f'  ⏭ 跳过: {screen.get("reason","")}', file=sys.stderr)
+            return {
+                'repo': f'{owner}/{name}',
+                **meta,
+                'verdict': 'skip',
+                'reason': screen.get('reason', ''),
+                'brief_category': screen.get('brief_category', ''),
+            }
+
+        print(f'  ✓ 值得深入 ({screen.get("brief_category","")})', file=sys.stderr)
+    else:
+        readme = fetch_readme(owner, name, token)
+
+    # Stage 2: Clone + 深度分析
+    print('  [Stage 2] Clone + 源码分析...', file=sys.stderr)
+    tmpdir = tempfile.mkdtemp(prefix='repo-')
+    try:
+        repo_dir = git_clone(owner, name, token, tmpdir)
+        if not repo_dir:
+            return {'repo': f'{owner}/{name}', **meta, 'verdict': 'error', 'reason': 'clone failed'}
+
+        local_readme, files, code_snippets = read_repo(repo_dir)
+        # 用本地 README 替代 API 获取的（更完整）
+        if local_readme:
+            readme = local_readme
+
+        print(f'  📁 {len(files)} files, {len(code_snippets)} code snippets', file=sys.stderr)
+
+        report = stage2_analyze(owner, name, meta, readme, files, code_snippets,
+                                lang, api_key, model)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return {
+        'repo': f'{owner}/{name}',
+        **meta,
+        'verdict': 'analyzed',
+        **report,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description='用 LLM 总结 GitHub 仓库')
+    parser = argparse.ArgumentParser(description='两阶段 GitHub 仓库分析工具')
     parser.add_argument('repo', help='owner/repo 或 GitHub URL')
-    parser.add_argument('--lang', '-l', default='en', choices=['en', 'zh'], help='输出语言')
+    parser.add_argument('--lang', '-l', default='zh', choices=['en', 'zh'], help='输出语言')
     parser.add_argument('--model', '-m', default='gpt-4o-mini')
     parser.add_argument('--json', '-j', action='store_true', help='输出原始 JSON')
+    parser.add_argument('--skip-stage1', action='store_true', help='跳过 README 筛选，直接分析')
     args = parser.parse_args()
 
     token = os.environ.get('GITHUB_TOKEN')
@@ -207,35 +334,33 @@ def main():
         sys.exit(1)
 
     owner, name = parse_repo(args.repo)
+    print(f'分析 {owner}/{name}...', file=sys.stderr)
 
-    tmpdir = tempfile.mkdtemp(prefix='repo-')
-    try:
-        print(f'Clone {owner}/{name}...', file=sys.stderr)
-        repo_dir = git_clone(owner, name, token, tmpdir)
+    result = analyze(owner, name, api_key, token, args.lang, args.model, args.skip_stage1)
 
-        meta = build_meta(repo_dir)
-        readme, files, code_snippets = walk_repo(repo_dir)
-
-        print(f'📁 {meta["language"]}  💾 {meta["size_kb"]}KB  📄 {len(files)} files', file=sys.stderr)
-
-        result = summarize(owner, name, meta, readme, files, code_snippets,
-                          args.lang, api_key, args.model)
-
-        if args.json:
-            out = {'repo': f'{owner}/{name}', 'stars': '-', **meta, **result}
-            print(json.dumps(out, ensure_ascii=False, indent=2))
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        if result.get('verdict') == 'skip':
+            print(f'\n⏭ {owner}/{name} — 跳过: {result.get("reason","")}')
         else:
             print(f'\n## {owner}/{name}')
+            cat = result.get('category', '?')
+            title = result.get('title', '')
+            conf = result.get('confidence', 0)
+            print(f'  类别: {cat} | 置信度: {conf:.0%}')
+            if title:
+                print(f'  {title}')
+            print()
             for point in result.get('summary', []):
                 print(f'  • {point}')
+            if result.get('technical_details'):
+                print(f'\n  技术细节: {result["technical_details"]}')
+            if result.get('usage_notes'):
+                print(f'  使用说明: {result["usage_notes"]}')
             tags = result.get('tags', [])
-            repo_type = result.get('type', '')
-            if repo_type:
-                print(f'  Type: {repo_type}')
             if tags:
-                print(f'  Tags: {", ".join(tags)}')
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+                print(f'  标签: {", ".join(tags)}')
 
 
 if __name__ == '__main__':

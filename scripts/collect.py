@@ -1,13 +1,8 @@
 """
-Main orchestrator: runs the full PoC collection pipeline.
+两阶段 PoC 采集主流程
 
-Pipeline:
-1. Load CVE list from chromium-cves.json
-2. For each CVE, search GitHub for related repos
-3. Fetch repo data (metadata + README + file tree)
-4. Rule-based pre-filter (skip LLM for clear cases)
-5. LLM classification for uncertain repos
-6. Output poc-results.json
+Stage 1: GitHub Search → README → LLM 筛选（快，便宜）
+Stage 2: 候选仓库 → clone → 源码分析（深，完整报告）
 """
 
 import argparse
@@ -19,271 +14,176 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from github_client import search_repos_for_cve, fetch_repo_full
-from classify_rules import classify_by_rules
-from classify_llm import classify_batch
+from github_client import search_repos_for_cve
+from summarize import analyze, fetch_readme, fetch_meta, stage1_screen
 
 
-def load_cve_list(cve_file: str) -> list[str]:
-    """Load CVE IDs from chromium-cves.json or a text file."""
+def load_cve_list(cve_file):
     with open(cve_file) as f:
         data = json.load(f)
-
     if isinstance(data, list):
-        # Could be list of strings or list of dicts
         if data and isinstance(data[0], str):
             return data
         elif data and isinstance(data[0], dict):
-            # Extract CVE IDs from dict
             for key in ['cve_id', 'id', 'CVE']:
                 if key in data[0]:
                     return [item[key] for item in data if key in item]
     elif isinstance(data, dict):
         return list(data.keys())
-
     raise ValueError(f'Cannot parse CVE list from {cve_file}')
 
 
-def collect_for_cve(cve_id: str, token: str | None = None,
-                    max_repos: int = 30) -> dict:
+def process_cve(cve_id, api_key, token=None, lang='zh', model='gpt-4o-mini',
+                max_repos=10):
     """
-    Collect and classify repos for a single CVE.
-    Returns {cve_id, repos: [{url, stars, language, category, confidence, reason, ...}]}.
+    处理单个 CVE：Stage 1 筛选 + Stage 2 深度分析。
     """
-    print(f'  Searching GitHub for {cve_id}...')
-    candidates = search_repos_for_cve(cve_id, token, max_repos)
+    print(f'\n{"="*50}')
+    print(f'[{cve_id}]')
+    print(f'{"="*50}')
 
+    # Step 1: GitHub Search
+    print(f'  搜索 GitHub...', file=sys.stderr)
+    candidates = search_repos_for_cve(cve_id, token, max_repos)
     if not candidates:
+        print(f'  无结果', file=sys.stderr)
         return {'cve_id': cve_id, 'repos': []}
 
-    print(f'  Found {len(candidates)} repos, fetching data...')
-    repos_with_data = []
+    print(f'  找到 {len(candidates)} 个仓库', file=sys.stderr)
+
+    # Step 2: Stage 1 — README 筛选
+    print(f'\n  --- Stage 1: README 筛选 ---', file=sys.stderr)
+    survivors = []
     for cand in candidates:
+        owner, name = cand['owner'], cand['name']
+        print(f'\n  📋 {owner}/{name}', file=sys.stderr)
+
         try:
-            full = fetch_repo_full(cand['owner'], cand['name'], token)
-            repos_with_data.append({
-                **cand,
-                'metadata': full['metadata'],
-                'readme': full['readme'],
-                'files': full['files'],
-            })
-        except Exception as e:
-            print(f'    Failed to fetch {cand["owner"]}/{cand["name"]}: {e}')
-            repos_with_data.append({
-                **cand,
-                'metadata': {},
-                'readme': '',
-                'files': [],
-            })
+            meta = fetch_meta(owner, name, token)
+            readme = fetch_readme(owner, name, token)
+        except SystemExit:
+            continue
 
-    return {'cve_id': cve_id, 'repos': repos_with_data}
+        if not readme:
+            print(f'    ⚠ 无 README，跳过', file=sys.stderr)
+            continue
 
+        screen = stage1_screen(owner, name, meta, readme, api_key, model=model)
+        verdict = screen.get('verdict', 'skip')
+        category = screen.get('brief_category', '')
+        reason = screen.get('reason', '')
 
-def classify_repos(cve_id: str, repos: list[dict], token: str | None = None,
-                   api_key: str | None = None, api_base: str | None = None,
-                   model: str = 'gpt-4o-mini') -> list[dict]:
-    """
-    Classify repos: rule-based first, then LLM for uncertain ones.
-    Returns list of classified repos.
-    """
-    results = []
-    llm_batch = []
-
-    for repo in repos:
-        rule_result = classify_by_rules(
-            owner=repo['owner'],
-            name=repo['name'],
-            stars=repo.get('stars', 0),
-            description=repo.get('description', ''),
-            readme=repo.get('readme', ''),
-            files=repo.get('files', []),
-        )
-        if rule_result:
-            category, confidence, reason = rule_result
-            results.append({
-                'url': repo['url'],
-                'owner': repo['owner'],
-                'name': repo['name'],
-                'stars': repo.get('stars', 0),
-                'language': repo.get('language'),
-                'description': repo.get('description', ''),
-                'category': category,
-                'confidence': confidence,
-                'classified_by': 'rules',
-                'reason': reason,
-                'readme_snippet': repo.get('readme', '')[:200],
-            })
+        if verdict == 'skip':
+            print(f'    ⏭ 跳过 ({category}): {reason[:60]}', file=sys.stderr)
         else:
-            llm_batch.append(repo)
+            print(f'    ✓ 候选 ({category}): {reason[:60]}', file=sys.stderr)
+            survivors.append({
+                'owner': owner,
+                'name': name,
+                'meta': meta,
+                'brief_category': category,
+                'screen_reason': reason,
+            })
 
-    # LLM classification for uncertain repos
-    if llm_batch and api_key:
-        print(f'    LLM classifying {len(llm_batch)} repos...')
-        llm_results = classify_batch(
-            cve_id=cve_id,
-            repos=llm_batch,
+    print(f'\n  Stage 1 结果: {len(candidates)} → {len(survivors)} 候选', file=sys.stderr)
+
+    if not survivors:
+        return {'cve_id': cve_id, 'repos': []}
+
+    # Step 3: Stage 2 — 深度分析
+    print(f'\n  --- Stage 2: 源码深度分析 ---', file=sys.stderr)
+    repos = []
+    for surv in survivors:
+        owner, name = surv['owner'], surv['name']
+        print(f'\n  🔍 {owner}/{name}', file=sys.stderr)
+
+        result = analyze(
+            owner=owner,
+            name=name,
             api_key=api_key,
-            api_base=api_base or 'https://api.openai.com/v1',
+            token=token,
+            lang=lang,
             model=model,
+            skip_stage1=True,  # Stage 1 已完成
         )
-        for repo, llm_result in zip(llm_batch, llm_results):
-            results.append({
-                'url': repo['url'],
-                'owner': repo['owner'],
-                'name': repo['name'],
-                'stars': repo.get('stars', 0),
-                'language': repo.get('language'),
-                'description': repo.get('description', ''),
-                'category': llm_result.get('category', 'unrelated'),
-                'confidence': llm_result.get('confidence', 0.3),
-                'classified_by': llm_result.get('classified_by', 'llm'),
-                'reason': llm_result.get('reason', ''),
-                'readme_snippet': repo.get('readme', '')[:200],
-            })
-    elif llm_batch:
-        print(f'    Skipping {len(llm_batch)} repos (no LLM API key)')
-        for repo in llm_batch:
-            results.append({
-                'url': repo['url'],
-                'owner': repo['owner'],
-                'name': repo['name'],
-                'stars': repo.get('stars', 0),
-                'language': repo.get('language'),
-                'description': repo.get('description', ''),
-                'category': 'unclassified',
-                'confidence': 0.0,
-                'classified_by': 'none',
-                'reason': 'No LLM API key available',
-                'readme_snippet': repo.get('readme', '')[:200],
-            })
+        repos.append(result)
 
-    # Sort by confidence descending
-    results.sort(key=lambda x: x.get('confidence', 0), reverse=True)
-    return results
+    return {'cve_id': cve_id, 'repos': repos}
 
 
-def build_report(results: dict) -> dict:
-    """Build final report from collected results."""
+def build_report(all_results):
     stats = {
-        'total_cves_searched': len(results),
-        'cves_with_results': sum(1 for r in results.values() if r.get('repos')),
-        'total_repos': sum(len(r.get('repos', [])) for r in results.values()),
+        'total_cves': len(all_results),
+        'cves_with_repos': sum(1 for r in all_results if r.get('repos')),
+        'total_repos_analyzed': sum(
+            sum(1 for repo in r.get('repos', []) if repo.get('verdict') == 'analyzed')
+            for r in all_results
+        ),
+        'repos_skipped': sum(
+            sum(1 for repo in r.get('repos', []) if repo.get('verdict') == 'skip')
+            for r in all_results
+        ),
         'by_category': {},
     }
-
-    for cve_data in results.values():
-        for repo in cve_data.get('repos', []):
-            cat = repo.get('category', 'unclassified')
-            stats['by_category'][cat] = stats['by_category'].get(cat, 0) + 1
+    for r in all_results:
+        for repo in r.get('repos', []):
+            if repo.get('verdict') == 'analyzed':
+                cat = repo.get('category', 'unknown')
+                stats['by_category'][cat] = stats['by_category'].get(cat, 0) + 1
 
     return {
         'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'stats': stats,
-        'results': results,
+        'results': {r['cve_id']: r for r in all_results},
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Collect and classify PoC/exploit repos for Chromium CVEs')
-    parser.add_argument('--cve-file', default='data/chromium-cves.json',
-                        help='Path to CVE list (JSON)')
-    parser.add_argument('--output', default='data/poc-results.json',
-                        help='Output file path')
-    parser.add_argument('--token', default=None,
-                        help='GitHub token (or GITHUB_TOKEN env)')
-    parser.add_argument('--api-key', default=None,
-                        help='LLM API key (or OPENAI_API_KEY env)')
-    parser.add_argument('--api-base', default=None,
-                        help='LLM API base URL (default: https://api.openai.com/v1)')
-    parser.add_argument('--model', default='gpt-4o-mini',
-                        help='LLM model name')
-    parser.add_argument('--max-cves', type=int, default=0,
-                        help='Max CVEs to process (0 = all)')
-    parser.add_argument('--max-repos', type=int, default=30,
-                        help='Max repos per CVE')
-    parser.add_argument('--skip-fetch', action='store_true',
-                        help='Skip GitHub fetch, use cached data only')
-    parser.add_argument('--cache-dir', default='data/cache',
-                        help='Cache directory for raw repo data')
+    parser = argparse.ArgumentParser(description='两阶段 PoC 采集')
+    parser.add_argument('--cve-file', default='data/chromium-cves.json')
+    parser.add_argument('--output', default='data/poc-results.json')
+    parser.add_argument('--token', default=None)
+    parser.add_argument('--api-key', default=None)
+    parser.add_argument('--model', default='gpt-4o-mini')
+    parser.add_argument('--lang', default='zh', choices=['en', 'zh'])
+    parser.add_argument('--max-cves', type=int, default=0)
+    parser.add_argument('--max-repos', type=int, default=10)
     args = parser.parse_args()
 
     token = args.token or os.environ.get('GITHUB_TOKEN')
     api_key = args.api_key or os.environ.get('OPENAI_API_KEY')
+    if not api_key:
+        print('需要设置 OPENAI_API_KEY', file=sys.stderr)
+        sys.exit(1)
 
-    if not token:
-        print('Warning: No GitHub token. Rate limits will be strict (10 req/min).')
-
-    # Load CVE list
-    print(f'Loading CVE list from {args.cve_file}...')
     cve_list = load_cve_list(args.cve_file)
     if args.max_cves > 0:
         cve_list = cve_list[:args.max_cves]
-    print(f'Processing {len(cve_list)} CVEs...')
 
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f'处理 {len(cve_list)} 个 CVE', file=sys.stderr)
 
-    results = {}
-    llm_calls = 0
-
+    all_results = []
     for i, cve_id in enumerate(cve_list):
-        print(f'\n[{i+1}/{len(cve_list)}] {cve_id}')
+        print(f'\n\n{"#"*60}', file=sys.stderr)
+        print(f'# [{i+1}/{len(cve_list)}] {cve_id}', file=sys.stderr)
+        print(f'{"#"*60}', file=sys.stderr)
 
-        cache_file = cache_dir / f'{cve_id}.json'
+        result = process_cve(cve_id, api_key, token, args.lang, args.model, args.max_repos)
+        all_results.append(result)
 
-        if args.skip_fetch and cache_file.exists():
-            with open(cache_file) as f:
-                cve_data = json.load(f)
-            print(f'  Loaded from cache: {len(cve_data.get("repos", []))} repos')
-        else:
-            cve_data = collect_for_cve(cve_id, token, args.max_repos)
-            # Cache raw data
-            with open(cache_file, 'w') as f:
-                json.dump(cve_data, f, indent=2)
+    report = build_report(all_results)
 
-        # Classify
-        classified = classify_repos(
-            cve_id=cve_id,
-            repos=cve_data.get('repos', []),
-            token=token,
-            api_key=api_key,
-            api_base=args.api_base,
-            model=args.model,
-        )
-
-        llm_count = sum(1 for r in classified if r.get('classified_by') == 'llm')
-        llm_calls += llm_count
-
-        results[cve_id] = {
-            'cve_id': cve_id,
-            'repos': classified,
-        }
-
-        cat_counts = {}
-        for r in classified:
-            cat = r.get('category', '?')
-            cat_counts[cat] = cat_counts.get(cat, 0) + 1
-        if cat_counts:
-            print(f'  Classification: {cat_counts}')
-        if llm_count:
-            print(f'  LLM calls: {llm_count}')
-
-    # Build report
-    report = build_report(results)
-
-    # Save
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w') as f:
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, 'w') as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    print(f'\n{"="*60}')
-    print(f'Report saved to {output_path}')
-    print(f'Total CVEs: {report["stats"]["total_cves_searched"]}')
-    print(f'CVEs with results: {report["stats"]["cves_with_results"]}')
-    print(f'Total repos: {report["stats"]["total_repos"]}')
-    print(f'By category: {report["stats"]["by_category"]}')
-    print(f'Total LLM calls: {llm_calls}')
+    print(f'\n\n{"="*60}', file=sys.stderr)
+    print(f'报告已保存: {args.output}', file=sys.stderr)
+    print(f'CVE 总数: {report["stats"]["total_cves"]}', file=sys.stderr)
+    print(f'有结果的 CVE: {report["stats"]["cves_with_repos"]}', file=sys.stderr)
+    print(f'分析的仓库: {report["stats"]["total_repos_analyzed"]}', file=sys.stderr)
+    print(f'跳过的仓库: {report["stats"]["repos_skipped"]}', file=sys.stderr)
+    print(f'分类: {report["stats"]["by_category"]}', file=sys.stderr)
 
 
 if __name__ == '__main__':
