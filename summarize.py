@@ -70,14 +70,50 @@ def _llm_call(messages, api_key, api_base=None, model='gpt-4o-mini', max_tokens=
         data=payload,
         headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
     )
-    with _opener().open(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-        content = data['choices'][0]['message']['content'].strip()
-        if content.startswith('```'):
-            content = content.split('```')[1]
-            if content.startswith('json'):
-                content = content[4:]
-        return json.loads(content)
+    try:
+        with _opener().open(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+            msg = data['choices'][0]['message']
+            content = (msg.get('content') or '').strip()
+            reasoning = (msg.get('reasoning_content') or '').strip()
+
+            # DeepSeek v4 推理模型：内容可能在 reasoning_content 中
+            text = content or reasoning
+
+            if not text:
+                print(f'LLM 返回空内容', file=sys.stderr)
+                return {'verdict': 'skip', 'reason': 'LLM returned empty response', 'brief_category': ''}
+
+            # 尝试从 text 中提取 JSON
+            # 先清理 markdown code block
+            if '```' in text:
+                parts = text.split('```')
+                if len(parts) >= 2:
+                    text = parts[1]
+                    if text.startswith('json'):
+                        text = text[4:]
+
+            # 直接尝试解析
+            try:
+                return json.loads(text.strip())
+            except json.JSONDecodeError:
+                pass
+
+            # 尝试找到第一个 { 到最后一个 }
+            if '{' in text and '}' in text:
+                start = text.index('{')
+                end = text.rindex('}') + 1
+                try:
+                    return json.loads(text[start:end])
+                except json.JSONDecodeError:
+                    pass
+
+            print(f'LLM 返回非 JSON: {text[:300]}', file=sys.stderr)
+            return {'verdict': 'skip', 'reason': 'LLM returned invalid JSON', 'brief_category': ''}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:500]
+        print(f'LLM API 错误 {e.code}: {body}', file=sys.stderr)
+        sys.exit(1)
 
 
 def parse_repo(input_str):
@@ -120,11 +156,9 @@ def stage1_screen(owner, name, meta, readme, api_key, model='gpt-4o-mini'):
     lang_instruction = '用中文回答。' if False else 'Output in English.'
 
     system_prompt = (
-        "You are a security researcher screening GitHub repos for CVE-related PoC/exploit analysis.\n\n"
-        "Decide if this repo is worth deep analysis (cloning and reading source code).\n\n"
-        + lang_instruction + "\n"
-        'Output JSON: {"verdict": "analyze|skip", "reason": "brief explanation", '
-        '"brief_category": "poc|exploit|detection|analysis|unrelated|malware"}'
+        "You are a security researcher screening GitHub repos.\n"
+        "IMPORTANT: Output ONLY valid JSON, no thinking, no explanation, no markdown.\n"
+        'Output format: {"verdict": "analyze|skip", "reason": "...", "brief_category": "poc|exploit|detection|analysis|unrelated|malware"}'
     )
 
     user_prompt = (
@@ -141,7 +175,7 @@ def stage1_screen(owner, name, meta, readme, api_key, model='gpt-4o-mini'):
         {'role': 'user', 'content': user_prompt},
     ]
 
-    return _llm_call(messages, api_key, model=model, max_tokens=150)
+    return _llm_call(messages, api_key, model=model, max_tokens=500)
 
 
 # ─── Stage 2: Clone + 源码深度分析 ────────────────────────────
@@ -250,7 +284,7 @@ def stage2_analyze(owner, name, meta, readme, files, code_snippets, lang='zh', a
         {'role': 'user', 'content': user_prompt},
     ]
 
-    return _llm_call(messages, api_key, model=model, max_tokens=600)
+    return _llm_call(messages, api_key, model=model, max_tokens=1500)
 
 
 # ─── 主流程 ────────────────────────────────────────────────────
@@ -263,7 +297,8 @@ def analyze(owner, name, api_key, token=None, lang='zh', model='gpt-4o-mini',
     """
     # 获取元数据
     meta = fetch_meta(owner, name, token)
-    print(f'  ⭐ {meta["stars"]}  🔤 {meta["language"]}  📝 {meta.get("description","")[:60]}', file=sys.stderr)
+    desc = (meta.get("description") or "")[:60]
+    print(f'  ⭐ {meta["stars"]}  🔤 {meta["language"]}  📝 {desc}', file=sys.stderr)
 
     # Stage 1: README 筛选
     if not skip_stage1:
