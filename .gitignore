@@ -2,4 +2,6 @@ __pycache__/
 *.pyc
 .env
 .venv/
-data/
+data/cache/
+data/poc-results.json
+data/poc-report.md
