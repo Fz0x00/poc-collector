@@ -226,11 +226,11 @@ def read_repo(repo_dir):
             files.append(rel_path)
 
             ext = os.path.splitext(fname)[1].lower()
-            if ext in CODE_EXTS and code_count < 8:
+            if ext in CODE_EXTS and code_count < 20:
                 fpath = os.path.join(root, fname)
                 try:
                     with open(fpath, errors='replace') as f:
-                        content = f.read()[:1500]
+                        content = f.read()[:5000]
                     code_snippets.append(f'--- {rel_path} ---\n{content}')
                     code_count += 1
                 except Exception:
@@ -275,7 +275,7 @@ def stage2_analyze(owner, name, meta, readme, files, code_snippets, lang='zh', a
         f"Description: {meta.get('description','N/A')}\n\n"
         f"README:\n{readme}\n\n"
         f"Files ({len(files)}): {file_list}\n\n"
-        f"Source code:\n{code_block[:4000]}\n\n"
+        f"Source code:\n{code_block[:16000]}\n\n"
         "Generate a complete analysis report. Output JSON:"
     )
 
